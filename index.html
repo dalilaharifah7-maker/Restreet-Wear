@@ -1008,6 +1008,7 @@ footer.site-footer{
         <div class="checkout-section-head"><h4>🚚 Metode Pengiriman</h4></div>
         <div id="checkoutCouriers" class="courier-options"></div>
         
+        <!-- Field lokasi & waktu COD -->
         <div id="shippingNotesWrap" style="display:none;margin-top:16px;padding-top:14px;border-top:1.5px solid var(--line-soft);">
           <label id="shippingNotesLabel">Lokasi & Waktu COD</label>
           <textarea id="shippingNotes" class="input" rows="2" placeholder=""></textarea>
@@ -1178,6 +1179,8 @@ footer.site-footer{
 <script>
 const SUPABASE_URL = 'https://jcnyibuzowdqombpobjm.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_NHvz9gT1DHPgrZ3bWXmBag_Nj9v_hLS';
+// Sesi login disimpan per TAB (sessionStorage), bukan dibagi ke semua tab. Jadi pembeli di satu tab dan
+// vendor/admin di tab lain bisa berjalan bersamaan tanpa saling menimpa. (Tutup tab = keluar otomatis.)
 try { window.sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { storage: window.sessionStorage, persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } }); }
 catch (e) { console.error('Supabase gagal dimuat:', e); window.sb = null; }
 
@@ -1192,12 +1195,14 @@ let currentCatId = null;
 let currentSearch = '';
 let ordersCache = [];
 let orderFilter = 'all';
+// TAMBAHKAN 2 BARIS INI:
 let filterMinPrice = 0;
 let filterMaxPrice = 0;
 let browseAll = false;
 
 function rupiah(n){ return 'Rp' + Math.round(n || 0).toLocaleString('id-ID'); }
 
+// ---------- HELPER TAMBAHAN ----------
 async function copyValue(btn){
   const text = btn && btn.dataset ? btn.dataset.copy : '';
   if(!text) return;
@@ -1219,6 +1224,7 @@ async function downloadQris(btn){
     if(!res.ok) throw new Error('HTTP ' + res.status);
     saveBlobAs(await res.blob(), name + '.jpg');
   } catch(e){
+    // cadangan: buka gambar di tab baru supaya bisa ditekan-tahan / klik kanan untuk simpan
     window.open(url, '_blank');
     showToast('Gambar dibuka di tab baru. Tekan lama / klik kanan lalu Simpan Gambar.');
   }
@@ -1290,6 +1296,7 @@ async function uploadImage(file, folder, maxSide, quality){
   if(error) throw error;
   return sb.storage.from('restreet-media').getPublicUrl(path).data.publicUrl;
 }
+// QRIS: coba upload ke Storage, kalau gagal simpan sebagai base64 kecil (cadangan)
 async function uploadQris(file){
   try { return await uploadImage(file, 'qris', 900, 0.92); }
   catch(e){
@@ -1299,12 +1306,14 @@ async function uploadQris(file){
   }
 }
 
+// ---------- HELPER UMUM ----------
 const PLACEHOLDER_IMG = 'data:image/svg+xml;utf8,' + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400"><rect width="400" height="400" fill="#EBE4D6"/><text x="200" y="210" font-family="monospace" font-size="20" text-anchor="middle" fill="#5C4A3A">No Image</text></svg>');
 function esc(s){
   return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 function imgSrc(u){ return u ? esc(u) : PLACEHOLDER_IMG; }
+// gambar rusak -> placeholder (tanpa loop tak berujung)
 document.addEventListener('error', function(e){
   const t = e.target;
   if (t && t.tagName === 'IMG' && !t.dataset.fb) { t.dataset.fb = '1'; t.src = PLACEHOLDER_IMG; }
@@ -1315,7 +1324,7 @@ function variantStock(variantId){
     const v = (p.product_variants || []).find(x => x.id === variantId);
     if (v) return Number(v.stock) || 0;
   }
-  return -1;
+  return -1; // varian tidak ditemukan
 }
 function productRating(p){
   const revs = (window.allReviews || []).filter(r => r.product_id === p.id);
@@ -1331,6 +1340,7 @@ function isVendorOnHoliday(vendorId){
   return !!(v && v.holiday_mode);
 }
 
+// ---------- STATUS PESANAN ----------
 const ORDER_STATUS_LABEL = {
   pending: 'Belum Bayar', pending_payment: 'Menunggu Konfirmasi Bayar', paid: 'Dibayar',
   processed: 'Diproses', shipped: 'Dikirim', completed: 'Selesai', cancelled: 'Dibatalkan'
@@ -1350,6 +1360,61 @@ function deriveOrderStatus(o){
 function statusBadgeClass(st){
   return st === 'completed' ? 'approved' : st === 'cancelled' ? 'rejected' : st === 'pending' || st === 'pending_payment' ? 'pending' : 'info';
 }
+
+// ---------- BATAS BAYAR 1 JAM + BUKTI BAYAR + BATAL ----------
+const PAY_WINDOW_MS = 60 * 60 * 1000;                       // batas bayar: 1 jam sejak pesanan dibuat
+const CANCELLABLE_STATUSES = ['pending', 'pending_payment', 'paid'];   // belum diproses toko
+function payDeadlineOf(s){ return new Date(s.created_at).getTime() + PAY_WINDOW_MS; }
+function awaitingBuyerPay(s){ return s.status === 'pending_payment' && !s.payment_confirmed_at; }
+function isPayExpired(s){ return awaitingBuyerPay(s) && Date.now() > payDeadlineOf(s); }
+function subStatusLabel(s){
+  if(s.status === 'pending_payment' && s.payment_confirmed_at) return 'Menunggu Verifikasi Bayar';
+  return ORDER_STATUS_LABEL[s.status] || s.status;
+}
+function fmtCountdown(ms){
+  const t = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(t / 60), sec = t % 60;
+  return String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
+}
+function safeUrl(u){ return /^https?:\/\//i.test(u || '') ? u : ''; }
+function proofLinkHtml(url){
+  const u = safeUrl(url);
+  return u ? '<a href="' + esc(u) + '" target="_blank" rel="noopener" style="font-size:0.75rem;font-weight:700;color:var(--rust);">📎 Lihat bukti bayar</a>' : '';
+}
+// batalkan otomatis item yang belum bayar & lewat 1 jam (server via RPC kalau ada, plus cadangan dari sisi pembeli)
+async function autoCancelExpired(orders){
+  const exp = [];
+  (orders || []).forEach(o => (o.sub_vendor_orders || []).forEach(s => { if(isPayExpired(s)) exp.push({ o: o, s: s }); }));
+  if(!exp.length) return false;
+  try { await sb.rpc('rw_auto_cancel_unpaid_orders'); } catch(e){}
+  for(const x of exp){
+    const r = await sb.from('sub_vendor_orders').update({ status: 'cancelled' }).eq('id', x.s.id).eq('status', 'pending_payment').is('payment_confirmed_at', null).select('id');
+    if(!r.error) x.s.status = 'cancelled';
+  }
+  for(const oid of new Set(exp.map(x => x.o.id))) await syncOrderStatus(oid);
+  return true;
+}
+// hitung mundur global: semua elemen [data-pay-deadline] diperbarui tiap detik
+let _payExpiryBusy = false;
+setInterval(function(){
+  document.querySelectorAll('[data-pay-deadline]').forEach(el => {
+    const left = Number(el.dataset.payDeadline) - Date.now();
+    if(left > 0){ el.textContent = fmtCountdown(left); return; }
+    el.textContent = 'Waktu habis';
+    if(el.dataset.expiredHandled) return;
+    el.dataset.expiredHandled = '1';
+    if(_payExpiryBusy || !window._currentOrderId) return;
+    _payExpiryBusy = true;
+    const payOpen = document.getElementById('paymentPage') && document.getElementById('paymentPage').style.display === 'block';
+    const detOpen = document.getElementById('orderDetailPage') && document.getElementById('orderDetailPage').style.display === 'block';
+    const listOpen = document.getElementById('ordersPage') && document.getElementById('ordersPage').style.display === 'block';
+    const done = () => { _payExpiryBusy = false; };
+    if(payOpen) openPaymentPage(window._currentOrderId).then(done, done);
+    else if(detOpen) openOrderDetail(window._currentOrderId).then(done, done);
+    else if(listOpen) loadOrders().then(done, done);
+    else done();
+  });
+}, 1000);
 
 function showToast(msg, type){
   const root = document.getElementById('toastRoot');
@@ -1392,6 +1457,9 @@ function persistCart(){
   localStorage.setItem('rw-cart', JSON.stringify(cart));
 }
 
+// ============================================================
+// AUTH
+// ============================================================
 async function doLogin(){
   if(!window.sb){ showToast('Server belum termuat. Cek internet lalu refresh halaman.', 'error'); return; }
   const email = document.getElementById('loginEmail').value.trim();
@@ -1442,6 +1510,7 @@ async function doRegister(){
   btn.innerHTML = origText;
   if(res.error){ showToast(esc(res.error.message || 'Gagal daftar'), 'error'); return; }
   if(res.data && res.data.session){
+    // konfirmasi email nonaktif -> Supabase otomatis login. Keluar dulu supaya alurnya konsisten.
     try { await sb.auth.signOut(); } catch(e){}
     showToast('Akun dibuat! Silakan masuk.', 'success');
   } else {
@@ -1495,6 +1564,7 @@ async function loadProfile(){
   const { data, error } = await sb.from('profiles').select('*').eq('id', currentUser.id).maybeSingle();
   if(error){ console.error('Profile error:', error); return; }
   if(data){ currentProfile = data; return; }
+  // Profil belum ada (mis. trigger database belum jalan) -> buat otomatis sebagai buyer
   const meta = currentUser.user_metadata || {};
   const row = {
     id: currentUser.id,
@@ -1526,6 +1596,7 @@ async function loadAppData(){
       .eq('status', 'Disetujui')
       .order('created_at', { ascending: false });
     if (e3) console.warn('products error:', e3.message);
+    // produk dari toko yang sudah dinonaktifkan tidak ikut tayang
     allProducts = (prods || []).filter(p => allVendors.some(v => v.id === p.vendor_id));
 
     const { data: revs, error: e4 } = await sb.from('reviews').select('*');
@@ -1543,6 +1614,7 @@ async function loadAppData(){
   }
 }
 
+// flash sale, pengumuman, pengaturan platform, kurir (dipakai di beranda & checkout)
 async function loadPublicExtras(){
   const safe = async fn => { try { const r = await fn(); return r.error ? null : r.data; } catch(e){ return null; } };
   window.flashSale = await safe(() => sb.from('flash_sale').select('*').eq('id', 1).maybeSingle());
@@ -1566,9 +1638,14 @@ async function refreshProducts(){
   } catch(e){ console.warn('refreshProducts', e); }
 }
 
+// ============================================================
+// HITUNG FOLLOWER & TERJUAL PER VENDOR
+// ============================================================
 async function loadVendorStats(){
+  // Simpan hasil ke window.vendorStats = { [vendorId]: { followers, sold } }
   window.vendorStats = {};
 
+  // Cara utama: fungsi database (tidak terhalang RLS, angka selalu akurat)
   try {
     const { data, error } = await sb.rpc('rw_vendor_stats');
     if (!error && Array.isArray(data)) {
@@ -1578,6 +1655,7 @@ async function loadVendorStats(){
     if (error) console.warn('rw_vendor_stats belum terpasang, pakai cara lama:', error.message);
   } catch(e){ console.warn(e); }
 
+  // 1. Hitung follower: ambil semua profiles yang punya following_vendors
   try {
     const { data: profiles, error } = await sb.from('profiles').select('following_vendors');
     if (!error && profiles) {
@@ -1591,6 +1669,7 @@ async function loadVendorStats(){
     }
   } catch(e){ console.warn('follower count error:', e); }
 
+  // 2. Hitung terjual: hitung sub_vendor_orders yang status 'completed'
   try {
     const { data: subOrders, error } = await sb.from('sub_vendor_orders')
       .select('vendor_id, qty')
@@ -1639,9 +1718,12 @@ async function init(){
     showToast('Server gagal dimuat. Cek koneksi internet lalu refresh.', 'error');
     return;
   }
+  // Kalau akun lain login/keluar di tab/jendela lain (sesi dibagi antar tab), tab ini harus ikut muat ulang,
+  // kalau tidak, tampilan masih akun lama tapi permintaan ke server memakai akun baru.
   try {
     sb.auth.onAuthStateChange(() => {
       if(window._loggingOut || !currentUser) return;
+      // ditunda & dicek ke sesi tab ini sendiri (hindari deadlock, dan abaikan login/keluar akun di tab lain)
       setTimeout(async () => {
         if(window._loggingOut || !currentUser) return;
         let sid = null;
@@ -1697,6 +1779,7 @@ async function showApp(forceBuyer){
 
 function backToPanel(){ showApp(); }
 
+// tampilkan kerangka toko (header + search) tanpa konten beranda
 function showShell(){
   document.querySelectorAll('.page').forEach(p => p.style.display = 'none');
   document.getElementById('appShell').style.display = 'flex';
@@ -1707,6 +1790,9 @@ function resetBrowseState(){
   const s = document.getElementById('globalSearch'); if(s) s.value = '';
 }
 
+// ============================================================
+// HEADER & HOME
+// ============================================================
 function renderHeader(){
   const cartCount = cart.reduce((s, i) => s + i.qty, 0);
   const nav = document.getElementById('navChips');
@@ -1802,6 +1888,7 @@ function renderPage(){
       const prices = (p.product_variants || []).map(v => unitPrice(v));
       const min = filterMinPrice || 0;
       const max = filterMaxPrice || Infinity;
+      // tampil kalau ada minimal satu varian yang harganya masuk rentang
       return prices.some(x => x >= min && x <= max);
     });
   }
@@ -1851,7 +1938,7 @@ function applyPriceFilter(){
 function resetPriceFilter(){
   filterMinPrice = 0;
   filterMaxPrice = 0;
-  renderPage();
+  renderPage(); // Render ulang tanpa filter
 }
 
 function homeBannersHtml(){
@@ -1944,6 +2031,9 @@ function renderFooter(){
   '</footer>';
 }
 
+// ============================================================
+// HANDLER FOOTER
+// ============================================================
 function footerAllProducts(){
   currentCatId = null;
   resetBrowseState();
@@ -2009,13 +2099,15 @@ function attachProductClicks(){
     el.onclick = () => goToProduct(el.dataset.pid);
   });
 
+  // tombol wishlist di kartu produk (jangan ikut membuka produk)
   document.querySelectorAll('[data-wish]').forEach(el => {
     el.onclick = (e) => { e.stopPropagation(); toggleWishlist(el.dataset.wish, el); };
   });
 
+  // 👇 Klik vendor → buka toko, JANGAN trigger buka produk
   document.querySelectorAll('[data-vendor-link]').forEach(el => {
     el.onclick = (e) => {
-      e.stopPropagation();
+      e.stopPropagation();   // ← penting!
       goToVendor(el.dataset.vendorLink);
     };
   });
@@ -2039,6 +2131,9 @@ function attachReveal(){
   els.forEach(el => revealObs.observe(el));
 }
 
+// ============================================================
+// VENDOR PAGE (buyer melihat toko)
+// ============================================================
 function goToVendor(vendorId){
   if(!vendorId) return;
   window.currentVendorId = vendorId;
@@ -2147,6 +2242,9 @@ async function toggleFollowVendor(vendorId, btn){
   showToast(wasFollowing ? 'Berhenti mengikuti toko' : 'Mengikuti toko', 'success');
 }
 
+// ============================================================
+// PRODUCT DETAIL PAGE
+// ============================================================
 function goToProduct(productId){
   showShell();
   document.getElementById('appShell').classList.add('compact');
@@ -2301,6 +2399,7 @@ function addToCartFromProductPage(pid){
   showToast('Ditambahkan ke keranjang', 'success');
 }
 
+// INI FUNGSI BARU UNTUK BELI SEKARANG (Berdiri sendiri)
 async function buyNow(pid){
   const p = allProducts.find(x => x.id === pid);
   const v = window.currentVariant;
@@ -2320,6 +2419,9 @@ async function buyNow(pid){
 }
 
 window.currentVendorId = null;
+// ============================================================
+// CART
+// ============================================================
 function syncCartPrices(){
   if(!(allProducts || []).length) return;
   let changed = false;
@@ -2434,6 +2536,9 @@ function openProduct(pid){
   );
 }
 
+// ============================================================
+// SHOW PAGE (routing untuk buyer)
+// ============================================================
 function showPage(name){
   const appShell = document.getElementById('appShell');
   const pages = ['accountPage','ordersPage','orderDetailPage','paymentPage','checkoutPage','wishlistPage','chatListPage','chatRoomPage','notificationsPage'];
@@ -2463,6 +2568,9 @@ function showPage(name){
   if(name === 'notifications') renderNotifications();
 }
 
+// ============================================================
+// ACCOUNT
+// ============================================================
 function renderAccount(){
   if(!currentProfile) return;
   const name = currentProfile.name || 'User';
@@ -2527,6 +2635,9 @@ async function saveEditProfile(){
   showToast('Profil disimpan', 'success');
 }
 
+// ============================================================
+// WISHLIST
+// ============================================================
 async function toggleWishlist(pid, btn){
   if(!currentProfile){ showToast('Login dulu untuk menyimpan wishlist', 'error'); return; }
   if(btn && btn.dataset.busy) return;
@@ -2538,6 +2649,7 @@ async function toggleWishlist(pid, btn){
   if(btn) delete btn.dataset.busy;
   if(error){ showToast('Gagal menyimpan wishlist: ' + esc(error.message), 'error'); return; }
   currentProfile.wishlist = next;
+  // sinkronkan semua tombol untuk produk ini (kartu & halaman detail)
   document.querySelectorAll('[data-wish]').forEach(b => {
     if(b.dataset.wish !== pid) return;
     b.innerHTML = has ? '🤍' : '❤️';
@@ -2564,6 +2676,9 @@ function renderWishlist(){
   attachProductClicks();
 }
 
+// ============================================================
+// CHECKOUT
+// ============================================================
 let checkoutState = {
   items: [], source: null, address: null, courier: null, payment: null, voucher: null, note: '', couriers: {}, payments: {}, pmCache: {}
 };
@@ -2571,7 +2686,7 @@ let checkoutState = {
 function freshCheckoutState(items, source){
   return {
     items: items, source: source,
-    address: checkoutState.address || null,
+    address: checkoutState.address || null,   // alamat terakhir dipakai ulang
     courier: null, payment: null, voucher: null, note: '',
     couriers: {}, payments: {}, pmCache: {}
   };
@@ -2602,6 +2717,7 @@ async function renderCheckout(){
   if(!checkoutState.payments) checkoutState.payments = {};
   if(!checkoutState.pmCache) checkoutState.pmCache = {};
 
+  // Alamat: otomatis pakai alamat utama kalau belum dipilih
   if(!checkoutState.address && currentUser){
     try {
       const { data: addrs } = await sb.from('addresses').select('*').eq('user_id', currentUser.id).order('is_default', { ascending: false });
@@ -2612,6 +2728,7 @@ async function renderCheckout(){
   const addr = checkoutState.address;
   const addrEl = document.getElementById('checkoutAddress');
 
+  // Render info alamat (selalu tampil, dengan/tanpa warning)
   if (addr) {
     const outOfRange = !isSemarangAddress(addr);
     addrEl.innerHTML =
@@ -2626,14 +2743,17 @@ async function renderCheckout(){
     addrEl.innerHTML = '<p class="muted">Belum ada alamat. Klik "Ganti" untuk menambah.</p>';
   }
 
+  // ---- ITEMS ----
   document.getElementById('checkoutItems').innerHTML = checkoutState.items.map(i =>
     '<div class="checkout-item"><img src="' + imgSrc(i.image) + '" alt=""><div class="info"><div style="font-weight:600;">' + esc(i.name) + '</div><div style="font-size:0.7rem;color:var(--brown-soft);">' + esc(i.size) + ' / ' + esc(i.color) + ' × ' + i.qty + '</div></div><div class="price">' + rupiah(i.price * i.qty) + '</div></div>'
   ).join('');
 
+  // ---- kelompok per toko ----
   const vendorGroups = {};
   checkoutState.items.forEach(it => { (vendorGroups[it.vendorId] = vendorGroups[it.vendorId] || []).push(it); });
   const vendorIds = Object.keys(vendorGroups);
 
+  // ---- METODE PENGIRIMAN PER TOKO ----
   const buyerCity = ((addr && addr.city) || '').toLowerCase();
   const buyerProv = ((addr && addr.province) || '').toLowerCase();
   const isSemarangArea = buyerCity.includes('semarang') || buyerProv.includes('jawa tengah');
@@ -2673,6 +2793,7 @@ async function renderCheckout(){
       methodCount++;
     }
     if (vendor.accepts_ekspedisi) {
+      // pakai daftar kurir dari admin; kalau admin belum mengisi, pakai tarif bawaan
       const couriers = (window.allCouriers || []).length ? window.allCouriers : [{ name: 'Ekspedisi (JNE/J&T)', base_price: 15000, eta_days: '2-4 hari kerja' }];
       couriers.forEach(c => {
         couriersHtml += renderShippingOption({ vendorId: vid, method: 'ekspedisi', icon: '📮', name: c.name, price: Number(c.base_price) || 0,
@@ -2684,13 +2805,15 @@ async function renderCheckout(){
       couriersHtml += '<div class="empty" style="padding:16px;font-size:0.85rem;">Toko ini belum menyediakan metode pengiriman.</div>';
     }
   });
-  if (myVersion !== checkoutRenderVersion) return;
+  if (myVersion !== checkoutRenderVersion) return;   // ada render yang lebih baru
   document.getElementById('checkoutCouriers').innerHTML = couriersHtml || '<div class="empty">Belum ada metode tersedia.</div>';
+  // buang pilihan yang sudah tidak tersedia (mis. ekspedisi setelah ganti alamat)
   Object.keys(checkoutState.couriers).forEach(vid => {
     const c = checkoutState.couriers[vid];
     if (!vendorGroups[vid] || !couriersHtml.includes('data-ship-vendor="' + vid + '" data-ship-method="' + c.method + '" data-ship-name="' + esc(c.name) + '"')) delete checkoutState.couriers[vid];
   });
 
+  // ---- METODE PEMBAYARAN PER TOKO ----
   const payEl = document.getElementById('checkoutPaymentMethods');
   let payHtml = '<div style="font-size:0.78rem;color:var(--brown-soft);margin-bottom:14px;padding:10px 12px;background:var(--cream);border-radius:var(--radius);border-left:3px solid var(--mustard);line-height:1.5;">' +
     '<strong>🔒 Rekber</strong> = dana ditahan platform sampai barang diterima.<br>' +
@@ -2757,7 +2880,7 @@ async function renderCheckout(){
       payHtml += '<div class="empty" style="padding:16px;font-size:0.85rem;">Toko ini belum menyediakan metode pembayaran.</div>';
     }
   }
-  if (myVersion !== checkoutRenderVersion) return;
+  if (myVersion !== checkoutRenderVersion) return;   // ada render yang lebih baru
   payEl.innerHTML = payHtml;
 
   Object.keys(checkoutState.payments).forEach(vid => {
@@ -2805,6 +2928,7 @@ function storeCouponDiscount(c, base){
   if(Number(c.max_discount) > 0) d = Math.min(d, Number(c.max_discount));
   return Math.max(0, Math.min(d, base));
 }
+// hitung semua diskon checkout: voucher platform + kupon toko (ditanggung toko, dibagi rata ke barang toko tsb)
 function checkoutDiscounts(subtotal){
   const sv = checkoutState.storeVouchers = checkoutState.storeVouchers || {};
   const items = checkoutState.items || [];
@@ -2850,6 +2974,7 @@ function updateCheckoutSummary(){
   document.getElementById('footerTotal').textContent = rupiah(total);
 }
 
+// ---------- KUPON TOKO (sisi pembeli) ----------
 window._storeCoupons = window._storeCoupons || {};
 function couponExpired(c){ return !!(c.expires_at && new Date(c.expires_at) < new Date()); }
 function couponExhausted(c){ return c.max_uses != null && Number(c.used_count || 0) >= Number(c.max_uses); }
@@ -3015,8 +3140,10 @@ function openAddAddressForm(){
   showModal(html);
   document.getElementById('addressPickerModal').style.display = 'none';
   
+  // auto-focus nama
   setTimeout(() => { const el = document.getElementById('addrName'); if(el) el.focus(); }, 100);
 }
+// Cek apakah string alamat mengandung kata "semarang"
 function isSemarangAddress(addr){
   if (!addr) return false;
   const city = (addr.city || '').toLowerCase();
@@ -3025,12 +3152,14 @@ function isSemarangAddress(addr){
   return !prov || prov.includes('jawa tengah');
 }
 
+// Daftar kecamatan Semarang (reusable)
 const KECAMATAN_SEMARANG = [
   'Semarang Tengah','Semarang Utara','Semarang Timur','Semarang Selatan','Semarang Barat',
   'Gajahmungkur','Candisari','Tembalang','Banyumanik','Gunungpati','Mijen','Ngaliyan',
   'Genuk','Pedurungan','Gayamsari','Tugu'
 ];
 
+// Cek apakah alamat berada di kecamatan Semarang
 function isInSemarangKecamatan(addr){
   if (!addr) return false;
   const text = ((addr.full_address || '') + ' ' + (addr.city || '')).toLowerCase();
@@ -3050,11 +3179,13 @@ async function saveAddress(){
   const phone = phoneEl ? phoneEl.value.trim() : '';
   const postal = postalEl ? postalEl.value.trim() : '';
   
+  // ---- Validasi field wajib ----
   if(!recipient){ showToast('Nama penerima wajib diisi', 'error'); nameEl.focus(); return; }
   if(!phone){ showToast('No. HP wajib diisi', 'error'); phoneEl.focus(); return; }
   if(!fullAddr){ showToast('Alamat lengkap wajib diisi', 'error'); fullEl.focus(); return; }
   if(!kecamatan){ showToast('Pilih kecamatan dulu', 'error'); kecamatanEl.focus(); return; }
   
+  // ---- Validasi kecamatan harus salah satu dari Semarang ----
   const kecamatanSemarang = [
     'Semarang Tengah','Semarang Utara','Semarang Timur','Semarang Selatan','Semarang Barat',
     'Gajahmungkur','Candisari','Tembalang','Banyumanik','Gunungpati','Mijen','Ngaliyan',
@@ -3065,12 +3196,15 @@ async function saveAddress(){
     return;
   }
   
+  // ---- Validasi kode pos (50xxx untuk Semarang) ----
   if (postal && !/^50\d{3}$/.test(postal)) {
     showToast('Kode pos Semarang harus diawali 50 (contoh: 50275)', 'error');
     postalEl.focus();
     return;
   }
   
+  // ---- Cek apakah alamat mengandung nama kecamatan (sanity check) ----
+  // Ini untuk memastikan alamat lengkap memang di kecamatan yang dipilih
   const addrLower = fullAddr.toLowerCase();
   const kecLower = kecamatan.toLowerCase().replace('semarang ', '').replace('kec. ', '').trim();
   const kecKeywords = kecLower.split(' ').filter(Boolean);
@@ -3085,6 +3219,7 @@ async function saveAddress(){
     if (!ok) { fullEl.focus(); return; }
   }
   
+  // ---- Susun data final ----
   const data = {
     user_id: currentUser.id,
     label: (document.getElementById('addrLabel').value.trim()) || 'Rumah',
@@ -3096,9 +3231,11 @@ async function saveAddress(){
     postal_code: postal || null
   };
   
+  // ---- Hitung default ----
   const { count } = await sb.from('addresses').select('*', { count: 'exact', head: true }).eq('user_id', currentUser.id);
   data.is_default = !count;
   
+  // ---- Insert ----
   const { data: created, error } = await sb.from('addresses').insert(data).select().single();
   if(error){ 
     showToast('Gagal menyimpan: ' + esc(error.message), 'error'); 
@@ -3108,6 +3245,7 @@ async function saveAddress(){
   closeModal();
   showToast('Alamat Semarang berhasil disimpan ✅', 'success');
   
+  // Refresh konteks
   const onCheckout = document.getElementById('checkoutPage').style.display !== 'none';
   if(onCheckout){
     checkoutState.address = created;
@@ -3187,6 +3325,7 @@ async function placeOrder(){
   btn.disabled = true; btn.textContent = 'Memproses...';
   const reset = () => { btn.disabled = false; btn.textContent = 'Buat Pesanan'; };
 
+  // cek stok terbaru
   try {
     const { data: fresh } = await sb.from('product_variants').select('id, stock').in('id', items.map(i => i.variantId));
     if (fresh && fresh.length) {
@@ -3248,9 +3387,11 @@ async function placeOrder(){
       shipping_notes: shippingNotes || null
     };
   });
+  // simpan salinan pilihan bayar untuk instruksi setelah pesanan jadi (state checkout akan direset)
   const paySnap = { vids: vendorIds.slice(), payments: Object.assign({}, checkoutState.payments), pm: Object.assign({}, checkoutState.pmCache || {}), platform: (window.platformPms || []).slice() };
   const { error: subErr } = await sb.from('sub_vendor_orders').insert(subOrders);
   if (subErr) {
+    // batalkan pesanan induk supaya tidak ada pesanan "kosong"
     const del = await sb.from('orders').delete().eq('id', order.id);
     if (del.error) await sb.from('orders').update({ status: 'cancelled' }).eq('id', order.id);
     reset();
@@ -3258,12 +3399,13 @@ async function placeOrder(){
     return;
   }
 
+  // keranjang hanya dikosongkan kalau checkout-nya memang dari keranjang (bukan "Beli Sekarang")
   if (checkoutState.source === 'cart') { cart = []; persistCart(); renderHeader(); }
   checkoutState = freshCheckoutState([], null);
   resetCheckoutForm();
   reset();
   showToast('Pesanan berhasil dibuat!', 'success');
-  await refreshProducts();
+  await refreshProducts();   // stok di tampilan ikut berkurang
   await openPaymentPage(order.id, paySnap);
 }
 
@@ -3292,6 +3434,7 @@ function paymentMethodBlockHtml(pm){
     '<div style="font-size:0.8rem;">a.n ' + esc(pm.owner || '-') + '</div>';
 }
 
+// Halaman pembayaran berbentuk nota (muncul setelah checkout, bisa dibuka lagi dari detail pesanan)
 async function openPaymentPage(orderId, snap){
   window._currentOrderId = orderId;
   showPage('payment');
@@ -3299,6 +3442,7 @@ async function openPaymentPage(orderId, snap){
   el.innerHTML = '<div class="loading-state"><div class="spinner"></div></div>';
   const { data: o, error } = await sb.from('orders').select('*, sub_vendor_orders(*)').eq('id', orderId).maybeSingle();
   if(error || !o){ el.innerHTML = '<div class="empty">Pesanan tidak ditemukan</div>'; return; }
+  await autoCancelExpired([o]);
   const vids = [...new Set((o.sub_vendor_orders || []).map(s => s.vendor_id))];
   const pmByVendor = {};
   for(const vid of vids){
@@ -3346,7 +3490,7 @@ function renderPaymentPage(o, pmByVendor, snap){
         (chosen ? paymentMethodBlockHtml(chosen)
           : (methods.length ? '<div style="font-size:0.8rem;margin-bottom:6px;">Metode pilihanmu: ' + esc(first.payment_detail || '-') + '</div>' + methods.map(paymentMethodBlockHtml).join('<hr style="border:none;border-top:1px dashed var(--brown);margin:10px 0;">')
                           : '<div>Toko belum menyediakan metode bayar. Hubungi toko lewat chat.</div>')) +
-        '<div style="font-size:0.78rem;color:var(--rust);margin-top:8px;">Transfer sesuai nominal, lalu tunggu toko mengonfirmasi pembayaran (atau kabari toko lewat chat).</div>' +
+        '<div style="font-size:0.78rem;color:var(--rust);margin-top:8px;">Transfer sesuai nominal dalam 1 jam, lalu upload bukti bayar di bawah dan tekan Konfirmasi Pembayaran.</div>' +
         '<div style="margin-top:8px;"><button class="btn small ghost" onclick="openChatWithVendor(\'' + esc(vid) + '\')">💬 Chat Toko</button></div></div>';
     } else {
       const plist = (snap && snap.platform && snap.platform.length ? snap.platform : window.platformPms) || [];
@@ -3361,10 +3505,11 @@ function renderPaymentPage(o, pmByVendor, snap){
           ? ((chosenP ? platformPmBlockHtml(chosenP)
               : (plist.length ? '<div style="font-size:0.8rem;margin-bottom:6px;">Pilih salah satu tujuan bayar platform:</div>' + plist.map(platformPmBlockHtml).join('<hr style="border:none;border-top:1px dashed var(--brown);margin:10px 0;">')
                               : '<div>Rekening platform belum diatur admin. Hubungi admin lewat Pusat Bantuan.</div>')) +
-            '<div style="font-size:0.78rem;color:var(--rust);margin-top:8px;">Transfer sesuai TOTAL nota. Setelah admin memverifikasi dana masuk, toko akan memproses pesananmu. Dana baru diteruskan ke toko setelah barang kamu terima.</div>')
+            '<div style="font-size:0.78rem;color:var(--rust);margin-top:8px;">Transfer sesuai TOTAL nota dalam 1 jam, lalu upload bukti bayar di bawah. Setelah admin memverifikasi dana masuk, toko akan memproses pesananmu. Dana baru diteruskan ke toko setelah barang kamu terima.</div>')
           : '<div>✅ Dana sudah diverifikasi platform dan ditahan aman sampai barang kamu terima.</div>') +
         '<div style="margin-top:8px;"><button class="btn small ghost" onclick="openChatWithVendor(\'' + esc(vid) + '\')">💬 Chat Toko</button></div></div>';
     }
+    html += proofBlockHtml(o.id, vid, list);
     html += '</div>';
   });
 
@@ -3378,9 +3523,97 @@ function renderPaymentPage(o, pmByVendor, snap){
   html += '<div style="display:flex;gap:10px;flex-wrap:wrap;">' +
     '<button class="btn primary" style="flex:1;" onclick="openOrderDetail(\'' + esc(o.id) + '\')">Lihat Pesanan Saya</button>' +
     '<button class="btn" style="flex:1;" onclick="showPage(\'home\')">Belanja Lagi</button></div>';
+  if(subs.some(x => CANCELLABLE_STATUSES.indexOf(x.status) >= 0)){
+    html += '<div style="margin-top:10px;"><button class="btn danger small" onclick="cancelWholeOrderFromPay(\'' + esc(o.id) + '\')">✕ Batalkan Pesanan</button></div>';
+  }
   el.innerHTML = html;
 }
 
+window._proofUrls = window._proofUrls || {};
+function proofBlockHtml(orderId, vid, list){
+  const waiting = list.filter(x => x.status === 'pending_payment');
+  if(!waiting.length) return '';
+  const sent = waiting.find(x => x.payment_confirmed_at);
+  if(sent){
+    return '<div class="proof-upload-box" style="border-style:solid;border-color:var(--sage);">' +
+      '<div style="font-weight:700;">✅ Bukti bayar sudah dikirim</div>' +
+      '<div style="font-size:0.8rem;color:var(--brown-soft);margin:4px 0 8px;">Tunggu ' + (list[0].payment_method === 'direct' ? 'toko' : 'admin') + ' memverifikasi pembayaranmu.</div>' +
+      (safeUrl(sent.payment_proof_url) ? '<a href="' + esc(safeUrl(sent.payment_proof_url)) + '" target="_blank" rel="noopener"><img class="proof-preview" src="' + esc(safeUrl(sent.payment_proof_url)) + '" alt="Bukti bayar"></a>' : '') +
+      '</div>';
+  }
+  const dl = Math.min.apply(null, waiting.map(payDeadlineOf));
+  if(Date.now() > dl){
+    return '<div class="proof-upload-box" style="border-color:var(--red);"><strong style="color:var(--red);">⏰ Waktu pembayaran habis</strong><div style="font-size:0.8rem;margin-top:4px;">Pesanan ini akan dibatalkan otomatis. Silakan buat pesanan baru.</div></div>';
+  }
+  const k = esc(vid);
+  return '<div class="proof-upload-box">' +
+    '<div style="font-weight:700;">⏰ Selesaikan pembayaran dalam <span style="color:var(--rust);font-family:\'JetBrains Mono\',monospace;" data-pay-deadline="' + dl + '">' + fmtCountdown(dl - Date.now()) + '</span></div>' +
+    '<div style="font-size:0.78rem;color:var(--brown-soft);margin:4px 0;">Batas bayar 1 jam sejak pesanan dibuat. Setelah transfer, upload screenshot bukti bayar, baru tombol konfirmasi bisa ditekan.</div>' +
+    '<input type="file" accept="image/*" id="proofFile-' + k + '" onchange="onProofPicked(\'' + k + '\')">' +
+    '<div id="proofStatus-' + k + '" style="font-size:0.76rem;margin-top:6px;color:var(--brown-soft);">Belum ada bukti bayar</div>' +
+    '<img id="proofPrev-' + k + '" class="proof-preview" alt="Preview bukti bayar" style="display:none;">' +
+    '<div style="margin-top:10px;"><button class="btn primary" id="proofBtn-' + k + '" disabled style="opacity:0.5;cursor:not-allowed;" onclick="confirmPayment(\'' + esc(orderId) + '\', \'' + k + '\')">✓ Konfirmasi Pembayaran</button></div>' +
+    '</div>';
+}
+async function onProofPicked(vid){
+  const input = document.getElementById('proofFile-' + vid);
+  const btn = document.getElementById('proofBtn-' + vid);
+  const st = document.getElementById('proofStatus-' + vid);
+  const prev = document.getElementById('proofPrev-' + vid);
+  if(!input || !btn) return;
+  delete window._proofUrls[vid];
+  btn.disabled = true; btn.style.opacity = '0.5'; btn.style.cursor = 'not-allowed';
+  prev.style.display = 'none';
+  const file = input.files && input.files[0];
+  if(!file){ st.textContent = 'Belum ada bukti bayar'; return; }
+  if(!/^image\//.test(file.type)){ st.textContent = 'File harus berupa gambar (screenshot)'; st.style.color = 'var(--red)'; input.value = ''; return; }
+  st.style.color = 'var(--brown-soft)'; st.textContent = 'Mengunggah bukti bayar...';
+  try {
+    const url = await uploadImage(file, 'payment-proof', 1400, 0.85);
+    window._proofUrls[vid] = url;
+    prev.src = url; prev.style.display = 'block';
+    st.style.color = 'var(--green, #2e7d32)'; st.textContent = '✅ Bukti terunggah. Sekarang kamu bisa konfirmasi pembayaran.';
+    btn.disabled = false; btn.style.opacity = '1'; btn.style.cursor = 'pointer';
+  } catch(e){
+    st.style.color = 'var(--red)'; st.textContent = 'Gagal upload: ' + (e && e.message ? e.message : e);
+    input.value = '';
+  }
+}
+async function confirmPayment(orderId, vid){
+  const url = window._proofUrls && window._proofUrls[vid];
+  if(!url){ showToast('Upload screenshot bukti bayar dulu', 'error'); return; }
+  const btn = document.getElementById('proofBtn-' + vid);
+  if(btn){ if(btn.disabled) return; btn.disabled = true; btn.textContent = 'Mengirim...'; }
+  const { data: o } = await sb.from('orders').select('*, sub_vendor_orders(*)').eq('id', orderId).maybeSingle();
+  const mine = ((o && o.sub_vendor_orders) || []).filter(x => x.vendor_id === vid && awaitingBuyerPay(x));
+  if(!mine.length || mine.some(isPayExpired)){
+    showToast('Waktu pembayaran sudah habis atau pesanan sudah dibatalkan', 'error');
+    await openPaymentPage(orderId); return;
+  }
+  const { data, error } = await sb.from('sub_vendor_orders')
+    .update({ payment_proof_url: url, payment_confirmed_at: new Date().toISOString() })
+    .eq('order_id', orderId).eq('vendor_id', vid).eq('status', 'pending_payment').is('payment_confirmed_at', null).select('id');
+  if(error){
+    showToast(/payment_proof_url|payment_confirmed_at|column/i.test(error.message || '') ? 'Kolom bukti bayar belum ada di database. Jalankan SQL restreet_payment_cancel.sql dulu.' : esc(error.message), 'error');
+    if(btn){ btn.disabled = false; btn.textContent = '✓ Konfirmasi Pembayaran'; }
+    return;
+  }
+  if(!data || !data.length){ showToast('Pesanan tidak bisa dikonfirmasi lagi', 'error'); await openPaymentPage(orderId); return; }
+  delete window._proofUrls[vid];
+  showToast('Bukti bayar terkirim. Tunggu verifikasi ya!', 'success');
+  await openPaymentPage(orderId);
+}
+async function cancelWholeOrderFromPay(orderId){
+  if(!confirm('Batalkan pesanan ini?')) return;
+  const { data, error } = await sb.from('sub_vendor_orders').update({ status: 'cancelled' }).eq('order_id', orderId).in('status', CANCELLABLE_STATUSES).select('id');
+  if(error){ showToast(esc(error.message), 'error'); return; }
+  if(!data || !data.length){ showToast('Pesanan sudah diproses toko, tidak bisa dibatalkan', 'error'); await openPaymentPage(orderId); return; }
+  await syncOrderStatus(orderId);
+  showToast('Pesanan dibatalkan', 'success');
+  openOrderDetail(orderId);
+}
+
+// Instruksi pembayaran setelah pesanan dibuat (per toko: transfer/QRIS langsung atau Rekber)
 function showPaymentInstructions(snap){
   const blocks = (snap.vids || []).map(vid => {
     const pay = (snap.payments || {})[vid];
@@ -3412,6 +3645,7 @@ async function loadOrders(){
   const { data, error } = await sb.from('orders').select('*, sub_vendor_orders(*)').eq('buyer_id', currentUser.id).order('created_at', { ascending: false });
   if(error){ list.innerHTML = '<div class="empty-state"><p>' + esc(error.message) + '</p></div>'; return; }
   ordersCache = data || [];
+  await autoCancelExpired(ordersCache);
   renderOrdersList();
 }
 
@@ -3433,12 +3667,14 @@ function renderOrdersList(){
     const st = deriveOrderStatus(o);
     const shippedList = shippedSubsOf(o);
     const shipStrip = shippedList.length ? '<div style="padding:10px 16px;border-top:1px dashed var(--line-soft);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;"><span style="font-size:0.74rem;color:var(--rust);">⏰ ' + autoReceiveText(earliestShipped(shippedList)) + '</span><button class="btn success small" onclick="event.stopPropagation();confirmOrderReceived(\'' + esc(o.id) + '\')">✓ Pesanan Diterima</button></div>' : '';
+    const payLeft = (o.sub_vendor_orders || []).filter(awaitingBuyerPay);
+    const payStrip = payLeft.length ? '<div style="padding:10px 16px;border-top:1px dashed var(--line-soft);font-size:0.78rem;color:var(--rust);">⏰ Bayar dalam <strong data-pay-deadline="' + Math.min.apply(null, payLeft.map(payDeadlineOf)) + '">' + fmtCountdown(Math.min.apply(null, payLeft.map(payDeadlineOf)) - Date.now()) + '</strong> · upload bukti bayar di halaman pembayaran</div>' : '';
     const needReview = (o.sub_vendor_orders || []).some(s => s.status === 'completed' && !(window.allReviews || []).some(r => r.product_id === s.product_id && currentUser && r.buyer_id === currentUser.id));
     return '<div class="order-card" style="margin-bottom:16px;cursor:pointer;" onclick="openOrderDetail(\'' + esc(o.id) + '\')">' +
       '<div class="order-head"><div class="order-no">#' + esc(o.id.slice(0, 8).toUpperCase()) + '</div><div class="order-date">' + new Date(o.created_at).toLocaleDateString('id-ID') + '</div></div>' +
       '<div class="order-body">' +
         (o.sub_vendor_orders || []).map(s => '<div class="order-item"><div class="info"><div class="name">' + esc(s.product_name) + '</div><div class="meta">' + esc(s.size) + ' / ' + esc(s.color) + ' × ' + s.qty + '</div></div><div class="price">' + rupiah(s.subtotal) + '</div></div>').join('') +
-      '</div>' + shipStrip +
+      '</div>' + shipStrip + payStrip +
       '<div class="order-foot"><div class="total">' + rupiah(o.total) + '</div><span>' + (needReview ? '<span class="badge promo" style="margin-right:6px;">⭐ Beri ulasan</span>' : '') + '<span class="badge ' + statusBadgeClass(st) + '">' + esc(ORDER_STATUS_LABEL[st] || st) + '</span></span></div>' +
     '</div>';
   }).join('');
@@ -3451,6 +3687,7 @@ async function openOrderDetail(id){
   el.innerHTML = '<div class="loading-state"><div class="spinner"></div></div>';
   const { data: o, error } = await sb.from('orders').select('*, sub_vendor_orders(*)').eq('id', id).maybeSingle();
   if(error || !o){ el.innerHTML = '<div class="empty">Pesanan tidak ditemukan</div>'; return; }
+  await autoCancelExpired([o]);
   let addr = null;
   if(o.address_id){
     const r = await sb.from('addresses').select('*').eq('id', o.address_id).maybeSingle();
@@ -3471,7 +3708,8 @@ function renderOrderDetail(o, addr){
     '<div class="order-head"><div class="order-no">#' + esc(o.id.slice(0, 8).toUpperCase()) + '</div>' +
     '<div class="order-date">' + new Date(o.created_at).toLocaleString('id-ID') + '</div></div>' +
     '<div class="order-foot" style="border-top:none;"><span>Status pesanan</span><span class="badge ' + statusBadgeClass(st) + '">' + esc(ORDER_STATUS_LABEL[st] || st) + '</span></div>' +
-    ((o.sub_vendor_orders || []).some(s => s.status === 'pending_payment') ? '<div style="padding:0 16px 14px;"><button class="btn primary small" onclick="openPaymentPage(\'' + esc(o.id) + '\')">💳 Lihat Cara Bayar</button></div>' : '') + shippedBannerDetail(o) + '</div>';
+    ((o.sub_vendor_orders || []).some(s => s.status === 'pending_payment') ? '<div style="padding:0 16px 14px;"><button class="btn primary small" onclick="openPaymentPage(\'' + esc(o.id) + '\')">💳 Bayar / Upload Bukti</button></div>' : '') +
+    ((o.sub_vendor_orders || []).some(s => CANCELLABLE_STATUSES.indexOf(s.status) >= 0) ? '<div style="padding:0 16px 14px;"><button class="btn danger small" onclick="cancelWholeOrder(\'' + esc(o.id) + '\')">✕ Batalkan Seluruh Pesanan</button><div style="font-size:0.72rem;color:var(--brown-soft);margin-top:6px;">Bisa dibatalkan selama toko belum memproses pesananmu.</div></div>' : '') + shippedBannerDetail(o) + '</div>';
 
   Object.keys(groups).forEach(vid => {
     const subs = groups[vid];
@@ -3494,11 +3732,13 @@ function renderOrderDetail(o, addr){
       const reviewed = (window.allReviews || []).some(r => r.product_id === s.product_id && currentUser && r.buyer_id === currentUser.id);
       let actions = '';
       if(s.status === 'shipped') actions += '<button class="btn success small" onclick="confirmReceived(\'' + esc(s.id) + '\')">✓ Pesanan Diterima</button> ';
-      if(s.status === 'pending' || s.status === 'pending_payment') actions += '<button class="btn danger small" onclick="cancelSubOrder(\'' + esc(s.id) + '\')">Batalkan</button> ';
+      if(CANCELLABLE_STATUSES.indexOf(s.status) >= 0) actions += '<button class="btn danger small" onclick="cancelSubOrder(\'' + esc(s.id) + '\')">Batalkan</button> ';
       if(s.status === 'completed') actions += reviewed ? '<span class="badge approved">Sudah diulas</span>' : '<button class="btn small" onclick="openReviewForm(\'' + esc(s.product_id) + '\', \'' + esc(s.vendor_id) + '\')">⭐ Beri Ulasan</button>';
       html += '<div class="order-item"><img src="' + imgSrc(img) + '" alt="">' +
         '<div class="info"><div class="name">' + esc(s.product_name) + '</div>' +
-        '<div class="meta">' + esc(s.size) + ' / ' + esc(s.color) + ' × ' + s.qty + ' · <span class="badge ' + statusBadgeClass(s.status) + '">' + esc(ORDER_STATUS_LABEL[s.status] || s.status) + '</span></div>' +
+        '<div class="meta">' + esc(s.size) + ' / ' + esc(s.color) + ' × ' + s.qty + ' · <span class="badge ' + statusBadgeClass(s.status) + '">' + esc(subStatusLabel(s)) + '</span></div>' +
+        (awaitingBuyerPay(s) ? '<div style="font-size:0.72rem;color:var(--rust);margin-top:4px;">⏰ Sisa waktu bayar: <strong data-pay-deadline="' + payDeadlineOf(s) + '">' + fmtCountdown(payDeadlineOf(s) - Date.now()) + '</strong></div>' : '') +
+        (s.status === 'pending_payment' && s.payment_confirmed_at ? '<div style="font-size:0.72rem;color:var(--brown-soft);margin-top:4px;">✅ Bukti bayar terkirim, menunggu diverifikasi</div>' : '') +
         (s.status === 'shipped' ? '<div style="font-size:0.72rem;color:var(--rust);margin-top:4px;">⏰ ' + autoReceiveText(s) + '</div>' : '') +
         (actions ? '<div style="margin-top:8px;">' + actions + '</div>' : '') + '</div>' +
         '<div class="price">' + rupiah(s.subtotal) + '</div></div>';
@@ -3508,7 +3748,7 @@ function renderOrderDetail(o, addr){
     html += '<div style="font-size:0.8rem;color:var(--brown-soft);margin-top:12px;line-height:1.7;">' +
       '🚚 ' + esc(first.shipping_name || '-') + ' (' + (first.shipping_cost > 0 ? rupiah(first.shipping_cost) : 'Gratis') + ')<br>' +
       '💳 ' + esc(first.payment_detail || '-') +
-      (first.status === 'pending_payment' ? '<br><strong style="color:var(--rust);">Transfer sesuai metode di atas, lalu tunggu toko mengonfirmasi pembayaran (atau hubungi toko lewat chat).</strong>' : '') +
+      (first.status === 'pending_payment' ? '<br><strong style="color:var(--rust);">Transfer sesuai metode di atas, upload bukti bayar di halaman pembayaran, lalu tunggu diverifikasi.</strong>' : '') +
       (first.shipping_notes ? '<br>📝 ' + esc(first.shipping_notes) : '') + '</div>';
     html += '</div></div>';
   });
@@ -3532,11 +3772,14 @@ async function syncOrderStatus(orderId){
   const { data: o } = await sb.from('orders').select('*, sub_vendor_orders(*)').eq('id', orderId).maybeSingle();
   if(!o) return;
   let st = deriveOrderStatus(o);
-  if(st === 'pending_payment') st = 'pending';
+  if(st === 'pending_payment') st = 'pending';   // kolom orders.status hanya mengenal status dasar
   if(st !== o.status) await sb.from('orders').update({ status: st }).eq('id', orderId);
 }
 
 
+// ================= AI REKOMENDASI (Resty) =================
+// Memanggil Supabase Edge Function "ai-recommend" (kunci API Claude disimpan di server, bukan di browser).
+// Kalau function belum di-deploy / gagal, otomatis pakai pencarian lokal supaya fitur tetap jalan.
 const AI_FUNCTION = 'ai-recommend';
 let aiHistory = [], aiBusy = false, aiLastSend = 0, aiInited = false;
 const AI_CHIPS = ['Aku mau ke pesta, pakai apa ya?', 'Outfit santai buat nongkrong', 'Kemeja buat kerja budget 150rb', 'Jaket yang lagi oke'];
@@ -3674,6 +3917,7 @@ async function aiSend(textOverride){
   aiBusy = false;
 }
 
+// ---------- AUTO-TERIMA PESANAN (3 hari) ----------
 const AUTO_RECEIVE_DAYS = 3;
 const DAY_MS = 86400000;
 function shippedAtOf(s){ return new Date(s.shipped_at || s.updated_at || s.created_at).getTime(); }
@@ -3699,6 +3943,7 @@ function shippedBannerDetail(o){
     (sh.length > 1 ? '<button class="btn success small" onclick="confirmOrderReceived(\'' + esc(o.id) + '\')">✓ Terima Semua Barang</button>' : '') + '</div>';
 }
 
+// dialog konfirmasi di dalam halaman (confirm() bawaan browser sering diblokir di WebView / iframe)
 function askConfirm(title, text, okLabel, onOk){
   window._askConfirmCb = onOk;
   showModal('<div class="modal-title">' + title + '</div>' +
@@ -3711,6 +3956,7 @@ async function markReceived(subIds){
   let okCount = 0, lastErr = null;
   for(const id of subIds){
     let done = false;
+    // .select() penting: kalau RLS menolak, update tidak error tapi 0 baris -> jangan dianggap sukses
     const r = await sb.from('sub_vendor_orders').update({ status: 'completed' }).eq('id', id).eq('status', 'shipped').select('id');
     if(r.error) lastErr = r.error;
     else if(r.data && r.data.length) done = true;
@@ -3749,6 +3995,7 @@ function confirmOrderReceived(orderId){
   const o = (ordersCache || []).find(x => x.id === orderId);
   const ids = o ? shippedSubsOf(o).map(x => x.id) : [];
   if(!ids.length){
+    // dibuka dari halaman detail: ambil dari DOM state terakhir
     sb.from('orders').select('*, sub_vendor_orders(*)').eq('id', orderId).maybeSingle().then(r => {
       const sh = r.data ? shippedSubsOf(r.data).map(x => x.id) : [];
       if(sh.length) askConfirm('Pesanan sudah diterima?', 'Pastikan barang sudah sampai dan sesuai. Setelah dikonfirmasi, pesanan selesai dan dana diteruskan ke toko.', '✓ Ya, Sudah Diterima', () => finishReceive(sh, orderId));
@@ -3758,6 +4005,7 @@ function confirmOrderReceived(orderId){
   askConfirm('Pesanan sudah diterima?', 'Pastikan barang sudah sampai dan sesuai. Setelah dikonfirmasi, pesanan selesai dan dana diteruskan ke toko.', '✓ Ya, Sudah Diterima', () => finishReceive(ids, orderId));
 }
 
+// Pengingat saat buyer buka aplikasi + jalankan auto-selesai (cadangan kalau pg_cron belum aktif)
 async function checkShippedReminders(){
   if(!window.sb || !currentUser || window._shipRemindShown) return;
   window._shipRemindShown = true;
@@ -3771,12 +4019,26 @@ async function checkShippedReminders(){
 
 async function cancelSubOrder(subId){
   if(!subId || !window._currentOrderId) return;
-  if(!confirm('Batalkan pesanan ini?')) return;
-  const { error } = await sb.from('sub_vendor_orders').update({ status: 'cancelled' }).eq('id', subId);
+  if(!confirm('Batalkan pesanan ini? Pesanan hanya bisa dibatalkan selama belum diproses toko.')) return;
+  const { data, error } = await sb.from('sub_vendor_orders').update({ status: 'cancelled' }).eq('id', subId).in('status', CANCELLABLE_STATUSES).select('id');
   if(error){ showToast(esc(error.message), 'error'); return; }
+  if(!data || !data.length){
+    showToast('Pesanan sudah diproses toko, jadi tidak bisa dibatalkan lagi', 'error');
+    openOrderDetail(window._currentOrderId); return;
+  }
   await syncOrderStatus(window._currentOrderId);
   showToast('Pesanan dibatalkan', 'success');
   openOrderDetail(window._currentOrderId);
+}
+async function cancelWholeOrder(orderId){
+  if(!orderId) return;
+  if(!confirm('Batalkan seluruh pesanan ini? Item yang sudah diproses toko tidak ikut dibatalkan.')) return;
+  const { data, error } = await sb.from('sub_vendor_orders').update({ status: 'cancelled' }).eq('order_id', orderId).in('status', CANCELLABLE_STATUSES).select('id');
+  if(error){ showToast(esc(error.message), 'error'); return; }
+  if(!data || !data.length){ showToast('Tidak ada item yang bisa dibatalkan (sudah diproses toko)', 'error'); openOrderDetail(orderId); return; }
+  await syncOrderStatus(orderId);
+  showToast(data.length + ' item dibatalkan', 'success');
+  openOrderDetail(orderId);
 }
 
 function openReviewForm(productId, vendorId){
@@ -3814,6 +4076,9 @@ async function copyOrderId(){
   showToast(ok ? 'Order ID disalin' : 'Gagal menyalin. Salin manual: ' + esc(window._currentOrderId), ok ? 'success' : 'error');
 }
 
+// ============================================================
+// MODAL MENU (support, vendor apply, dll)
+// ============================================================
 async function openAddresses(){
   const { data: addrs } = await sb.from('addresses').select('*').eq('user_id', currentUser.id).order('is_default', { ascending: false });
   const list = (addrs || []).map(a =>
@@ -3958,6 +4223,9 @@ function openAttachmentMenu(){
   inp.click();
 }
 
+// ============================================================
+// NOTIFICATIONS
+// ============================================================
 function openNotifications(){ showPage('notifications'); }
 
 let notifChannel = null;
@@ -4011,6 +4279,9 @@ async function loadNotifCount(){
   if(el) el.textContent = count || 0;
 }
 
+// ============================================================
+// CHAT
+// ============================================================
 function openChatList(){ showPage('chatList'); }
 
 async function renderChatList(){
@@ -4021,6 +4292,7 @@ async function renderChatList(){
     list.innerHTML = '<div class="empty">Belum ada chat</div>';
     return;
   }
+  // hitung pesan belum dibaca per chat
   const { data: unread } = await sb.from('chat_messages').select('chat_id').in('chat_id', data.map(c => c.id)).neq('sender_id', currentUser.id).eq('is_read', false);
   const unreadMap = {};
   (unread || []).forEach(m => { unreadMap[m.chat_id] = (unreadMap[m.chat_id] || 0) + 1; });
@@ -4047,6 +4319,7 @@ async function openChatWithVendor(vendorId){
   if(!vendor){ showToast('Vendor tidak ditemukan', 'error'); return; }
   if(!vendor.user_id){ showToast('Toko ini belum bisa dichat', 'error'); return; }
   if(vendor.user_id === currentUser.id){ showToast('Ini tokomu sendiri', 'error'); return; }
+  // tampilkan ruang chat dulu supaya tidak berkedip kosong
   showPage('chatRoom');
   document.getElementById('chatMessages').innerHTML = '<div class="loading-state"><div class="spinner"></div></div>';
   const { data: existing } = await sb.from('chats').select('*').eq('buyer_id', currentUser.id).eq('vendor_id', vendorId).maybeSingle();
@@ -4096,6 +4369,7 @@ async function openChatRoom(chatId){
   messagesEl.innerHTML = (msgs && msgs.length) ? msgs.map(chatBubbleHtml).join('') : '<div class="empty" id="chatEmpty">Belum ada pesan</div>';
   messagesEl.scrollTop = messagesEl.scrollHeight;
 
+  // tandai pesan lawan bicara sebagai terbaca
   sb.from('chat_messages').update({ is_read: true }).eq('chat_id', chatId).neq('sender_id', currentUser.id).eq('is_read', false).then(() => loadChatCount());
 
   if(chatRealtime) sb.removeChannel(chatRealtime);
@@ -4105,6 +4379,7 @@ async function openChatRoom(chatId){
       const empty = document.getElementById('chatEmpty'); if(empty) empty.remove();
       messagesEl.insertAdjacentHTML('beforeend', chatBubbleHtml(payload.new));
       messagesEl.scrollTop = messagesEl.scrollHeight;
+      // sedang membuka ruang ini -> langsung tandai terbaca
       sb.from('chat_messages').update({ is_read: true }).eq('id', payload.new.id).then(() => loadChatCount());
     })
     .subscribe();
@@ -4120,6 +4395,7 @@ async function sendChatMessage(imageUrl){
   if(isImg) row.image_url = imageUrl;
   const { error } = await sb.from('chat_messages').insert(row);
   if(error){ if(!isImg) input.value = content; showToast(esc(error.message), 'error'); return; }
+  // pesan terakhir di daftar chat diperbarui trigger database; ini cadangan kalau trigger belum terpasang
   await sb.from('chats').update({ last_message: content || '📷 Gambar', last_message_at: new Date().toISOString() }).eq('id', currentChatId);
   const messagesEl = document.getElementById('chatMessages');
   const empty = document.getElementById('chatEmpty'); if(empty) empty.remove();
@@ -4147,6 +4423,9 @@ function setActiveBottomNav(name){
     if(items[i]) items[i].classList.add('active');
   }
 }
+// ============================================================
+// ADMIN PANEL
+// ============================================================
 let adminPage = 'a-dashboard';
 let adminVendorTab = 'pending';
 let adminProductTab = 'pending';
@@ -4227,18 +4506,20 @@ function adminBadgeCounts() {
   };
 }
 
+// antrean verifikasi Rekber, dikelompokkan per pesanan
 function rekberQueueGroups() {
   let rows;
   if (Array.isArray(adminState.rekberQueue)) rows = adminState.rekberQueue;
   else rows = (adminState.orders || []).flatMap(o => (o.sub_vendor_orders || [])
     .filter(s => s.payment_method === 'rekber' && (s.status === 'pending_payment' || s.status === 'pending'))
     .map(s => ({ order_id: o.id, sub_id: s.id, buyer_name: o.buyer_name, vendor_name: (adminState.vendors.find(v => v.id === s.vendor_id) || {}).store_name,
-                 product_name: s.product_name, qty: s.qty, subtotal: s.subtotal, order_total: o.total, payment_detail: s.payment_detail, status: s.status, created_at: s.created_at })));
+                 product_name: s.product_name, qty: s.qty, subtotal: s.subtotal, order_total: o.total, payment_detail: s.payment_detail, payment_proof_url: s.payment_proof_url, payment_confirmed_at: s.payment_confirmed_at, status: s.status, created_at: s.created_at })));
   const map = {};
   rows.forEach(r => { (map[r.order_id] = map[r.order_id] || { order_id: r.order_id, buyer_name: r.buyer_name, order_total: r.order_total, created_at: r.created_at, items: [] }).items.push(r); });
   return Object.values(map);
 }
 
+// perbarui lencana menu admin tanpa merender ulang halaman (supaya isian form tidak hilang)
 function paintAdminBadges() {
   const c = adminBadgeCounts();
   document.querySelectorAll('#adminNav [data-apage]').forEach(el => {
@@ -4251,6 +4532,7 @@ function paintAdminBadges() {
   });
 }
 
+// penyegaran otomatis: pesanan/pembayaran/tiket/pengajuan baru langsung masuk tanpa refresh halaman
 let adminChannel = null, adminRefreshTimer = null;
 function subscribeAdminRealtime() {
   if (!window.sb) return;
@@ -4260,6 +4542,7 @@ function subscribeAdminRealtime() {
     adminRefreshTimer = setTimeout(async () => {
       try {
         await adminLoadAll();
+        // hanya halaman tanpa form yang digambar ulang otomatis (agar ketikan admin tidak hilang)
         if (['a-dashboard', 'a-orders', 'a-escrow', 'a-commission', 'a-withdrawals'].includes(adminPage)) renderAdminPanel();
         else paintAdminBadges();
       } catch (e) { console.warn(e); }
@@ -4287,7 +4570,7 @@ async function adminLoadAll() {
     const rq = await sb.rpc('rw_admin_rekber_queue');
     if (!rq.error && Array.isArray(rq.data)) adminState.rekberQueue = rq.data;
     else {
-      adminState.rekberQueue = null;
+      adminState.rekberQueue = null;   // fungsi belum dipasang -> pakai cadangan dari data pesanan
       if (rq.error) console.warn('rw_admin_rekber_queue belum terpasang:', rq.error.message);
     }
   } catch (e) { adminState.rekberQueue = null; }
@@ -4579,7 +4862,7 @@ async function adminOrderDetail(id) {
     const terminal = s.status === 'completed' || s.status === 'cancelled';
     return '<tr><td>' + esc(s.product_name) + ' × ' + (s.qty || 1) + '<div style="font-size:0.7rem;color:var(--brown-soft);">' + esc(s.size || '') + ' / ' + esc(s.color || '') + '</div></td>' +
       '<td>' + esc(v ? v.store_name : '-') + '</td>' +
-      '<td><span class="badge ' + statusBadgeClass(s.status) + '">' + esc(ORDER_STATUS_LABEL[s.status] || s.status) + '</span><div style="font-size:0.7rem;margin-top:4px;">' + (s.payment_method === 'direct' ? '💸 Langsung' : '🔒 Rekber') + '</div></td>' +
+      '<td><span class="badge ' + statusBadgeClass(s.status) + '">' + esc(ORDER_STATUS_LABEL[s.status] || s.status) + '</span><div style="font-size:0.7rem;margin-top:4px;">' + (s.payment_method === 'direct' ? '💸 Langsung' : '🔒 Rekber') + '</div>' + (s.payment_proof_url ? '<div style="margin-top:4px;">' + proofLinkHtml(s.payment_proof_url) + '</div>' : '') + '</td>' +
       '<td class="mono">' + rupiah(s.subtotal) + '</td>' +
       '<td>' + (terminal ? '' : '<button class="btn danger small" onclick="adminCancelSub(\'' + esc(s.id) + '\', \'' + esc(o.id) + '\')">Batalkan</button>') + '</td></tr>';
   }).join('');
@@ -4609,7 +4892,7 @@ function adminEscrow() {
   let held = 0, released = 0, commission = 0;
   const heldRows = [];
   adminState.orders.forEach(o => (o.sub_vendor_orders || []).forEach(sv => {
-    if (sv.payment_method === 'direct') return;
+    if (sv.payment_method === 'direct') return;            // bayar langsung tidak lewat rekber
     const sub = Number(sv.subtotal || 0);
     const pct = sv.commission_percent != null ? Number(sv.commission_percent) : commPct;
     const comm = Math.round(sub * pct / 100);
@@ -4622,7 +4905,7 @@ function adminEscrow() {
       toVerify.map(g => '<tr><td class="mono" style="font-size:0.8rem;">#' + esc(String(g.order_id).slice(0, 8).toUpperCase()) + '</td><td>' + esc(g.buyer_name || '-') + '</td>' +
         '<td style="font-size:0.8rem;">' + g.items.map(s => esc(s.product_name) + ' ×' + (s.qty || 1) + (s.vendor_name ? ' <span style="color:var(--brown-soft);">(' + esc(s.vendor_name) + ')</span>' : '')).join('<br>') + '</td>' +
         '<td class="mono">' + rupiah(g.items.reduce((a, s) => a + Number(s.subtotal || 0), 0)) + '</td><td class="mono">' + rupiah(g.order_total) + '</td>' +
-        '<td style="font-size:0.78rem;">' + esc(g.items[0].payment_detail || '-') + '</td>' +
+        '<td style="font-size:0.78rem;">' + esc(g.items[0].payment_detail || '-') + (g.items.find(x => x.payment_proof_url) ? '<div style="margin-top:4px;">' + proofLinkHtml(g.items.find(x => x.payment_proof_url).payment_proof_url) + '</div>' : '<div style="margin-top:4px;color:var(--brown-soft);">Belum ada bukti</div>') + '</td>' +
         '<td><button class="btn success small" data-verifyrekber="' + esc(g.order_id) + '">✓ Dana Sudah Masuk</button></td></tr>').join('') + '</tbody></table>'
       : '<div class="empty" style="margin-bottom:18px;">Tidak ada pembayaran Rekber yang menunggu verifikasi.</div>');
   return '<div class="panel-title">Rekber (Escrow)</div><div class="panel-sub">Pembeli transfer ke rekening platform → kamu verifikasi dana masuk → toko memproses → dana ditahan sampai barang diterima.</div>' + verifyHtml +
@@ -4684,6 +4967,7 @@ function adminWithdrawals() {
     }).join('') + '</tbody></table>';
 }
 
+// antrean komisi bayar-langsung yang sudah ditransfer vendor dan menunggu konfirmasi admin
 function commissionQueueGroups(){
   const g = {};
   (adminState.orders || []).forEach(o => (o.sub_vendor_orders || []).forEach(sv => {
@@ -4868,7 +5152,7 @@ function attachAdminEvents() {
   document.querySelectorAll('[data-deletevendor]').forEach(el => el.onclick = async () => {
     if (!confirm('Hapus permanen? Produk toko ini ikut terhapus dan akun pemiliknya kembali jadi pembeli.')) return;
     try { await dbq(sb.from('vendors').delete().eq('id', el.dataset.deletevendor)); }
-    catch (e) { return; }
+    catch (e) { return; }   // pesan error (mis. toko punya riwayat pesanan) sudah muncul sebagai toast
     await logActivity('Menghapus vendor');
     await adminLoadAll(); renderAdminPanel();
   });
@@ -5041,6 +5325,7 @@ function attachAdminEvents() {
     const rv = await sb.rpc('rw_admin_verify_rekber', { p_order: oid });
     if (rv.error) {
       if (/function|schema cache|does not exist/i.test(rv.error.message || '')) {
+        // fungsi server belum dipasang -> cara lama (butuh izin tabel untuk admin)
         const o = adminState.orders.find(x => x.id === oid);
         const subs = ((o && o.sub_vendor_orders) || []).filter(x => x.payment_method === 'rekber' && (x.status === 'pending_payment' || x.status === 'pending'));
         if (!subs.length) { showToast('Item pesanan tidak terbaca. Jalankan restreet_fix_6.sql dan restreet_fix_7.sql.', 'error'); return; }
@@ -5105,6 +5390,9 @@ function attachAdminEvents() {
     await adminLoadAll(); renderAdminPanel();
   });
 }
+// ============================================================
+// VENDOR PANEL
+// ============================================================
 let vendorPage = 'v-dashboard';
 let vendorState = { profile: null, products: [], orders: [], reviews: [], withdrawals: [], pms: [] };
 
@@ -5165,6 +5453,7 @@ function subscribeVendorOrders(){
   vendorChannel = sb.channel('vendor-orders-' + v.id)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'sub_vendor_orders', filter: 'vendor_id=eq.' + v.id }, async () => {
       await vendorLoadAll();
+      // jangan render ulang halaman yang sedang berisi form (profil/produk) supaya ketikan tidak hilang
       if (['v-orders', 'v-dashboard', 'v-wallet'].includes(vendorPage)) renderVendorPanel();
     })
     .on('postgres_changes', { event: '*', schema: 'public', table: 'chat_messages' }, () => { refreshVendorUnread(); })
@@ -5181,6 +5470,7 @@ async function refreshVendorUnread(){
   } catch(e){}
   paintVendorBadges();
 }
+// perbarui lencana tanpa merender ulang halaman (supaya isian form tidak hilang)
 function paintVendorBadges(){
   const c = vendorBadgeCounts();
   const map = { 'v-orders': 'pendingOrders', 'v-chat': 'chat', 'v-notif': 'notif' };
@@ -5208,9 +5498,11 @@ async function vendorLoadAll() {
     try { const r = await fn(); if (r.error) { console.warn(r.error.message); return []; } return r.data || []; }
     catch(e) { return []; }
   };
+  // daftar kategori dibutuhkan form produk vendor (panel vendor tidak melewati loadAppData)
   if (!(allCategories || []).length) {
     try { const { data: cats } = await sb.from('categories').select('*').order('name'); allCategories = cats || []; } catch(e) {}
   }
+  // ambil profil terbaru supaya saldo selalu akurat (saldo diubah oleh sistem, bukan oleh halaman ini)
   try { const { data: fresh } = await sb.from('vendors').select('*').eq('id', v.id).maybeSingle(); if (fresh) vendorState.profile = fresh; } catch(e) {}
   vendorState.ledger = await safe(() => sb.from('commission_ledger').select('*').eq('vendor_id', v.id).order('created_at', { ascending: false }));
   vendorState.coupons = await safe(() => sb.from('store_vouchers').select('*').eq('vendor_id', v.id).order('created_at', { ascending: false })) || [];
@@ -5292,6 +5584,7 @@ function vendorProfilePage() {
   return '<div class="panel-title">Profil Toko</div>' +
     '<div class="panel-sub">Atur info yang tampil ke pembeli.</div>' +
     
+    // PROFIL DASAR
     '<div class="panel-card" style="max-width:620px;">' +
       '<div class="form-row"><label>Nama Toko</label><input id="vpName" value="' + esc(v.store_name || '') + '"></div>' +
       '<div class="form-row"><label>Logo Emoji</label><input id="vpEmoji" value="' + esc(v.logo_emoji || '🏪') + '" placeholder="🏪" maxlength="4"></div>' +
@@ -5303,6 +5596,7 @@ function vendorProfilePage() {
       '<button class="btn primary" id="vpSaveBtn">Simpan</button>' +
     '</div>' +
 
+    // PENGIRIMAN
     '<div class="panel-card" style="max-width:620px;margin-top:16px;">' +
       '<h4 style="font-family:\'Fraunces\',serif;font-size:1.1rem;margin-bottom:12px;">🚚 Metode Pengiriman</h4>' +
       
@@ -5342,6 +5636,7 @@ function vendorProfilePage() {
       '<button class="btn primary" id="vpSaveShippingBtn">💾 Simpan Metode Pengiriman</button>' +
     '</div>' +
 
+    // METODE PEMBAYARAN
     '<div class="panel-card" style="max-width:620px;margin-top:16px;">' +
       '<h4 style="font-family:\'Fraunces\',serif;font-size:1.1rem;margin-bottom:12px;">💳 Metode Pembayaran</h4>' +
       '<div class="panel-grid g-2">' +
@@ -5351,11 +5646,13 @@ function vendorProfilePage() {
         '<div><label>Atas Nama</label><input id="vpmOwner"></div>' +
       '</div>' +
 
+      // 👇👇👇 TAMBAHAN BARU: field upload QRIS 👇👇👇
       '<div id="vpmQrisWrap" style="display:none;margin-top:12px;padding:14px;background:var(--cream);border:2px dashed var(--rust);border-radius:var(--radius);">' +
         '<label style="margin-bottom:6px;">📷 Upload Gambar QRIS</label>' +
         '<input type="file" id="vpmQrisImage" accept="image/*" style="font-size:0.85rem;">' +
         '<div id="vpmQrisPreview" style="margin-top:10px;"></div>' +
       '</div>' +
+      // 👆👆👆 SAMPAI SINI 👆👆👆
 
       '<button class="btn primary" id="vpmAddBtn" style="margin-top:10px;">+ Tambah Metode</button>' +
       '<div id="vpmList" style="margin-top:16px;"></div>' +
@@ -5431,6 +5728,7 @@ function vendorProductsPage() {
 }
 
 
+// ---------- KOMISI PEMBAYARAN LANGSUNG ----------
 function commStatusOf(o){ return o.comm_status || 'unpaid'; }
 function commGroupFor(o){
   return (vendorState.orders || []).filter(x => x.order_id === o.order_id && x.payment_method === 'direct' &&
@@ -5507,8 +5805,12 @@ function vendorOrdersPage() {
         '<td><span class="badge ' + (pm === 'rekber' ? 'info' : 'neutral') + '">' + (pm === 'rekber' ? '🔒 Rekber' : '💸 ' + esc(o.payment_detail || 'Langsung')) + '</span></td>' +
         '<td><span class="badge ' + stClass + '">' + esc(stLabel) + '</span></td>' +
         '<td>' +
-          (o.status === 'pending_payment' && o.payment_method === 'direct' ? '<button class="btn success small" data-vconfirmpay="' + esc(o.id) + '">Konfirmasi Bayar</button> ' : '') +
-          (o.status === 'pending_payment' && o.payment_method !== 'direct' ? '<span class="badge info" style="margin-right:4px;">Menunggu dana Rekber</span> ' : '') +
+          (o.status === 'pending_payment' && o.payment_method === 'direct'
+            ? (o.payment_confirmed_at
+                ? proofLinkHtml(o.payment_proof_url) + ' <button class="btn success small" data-vconfirmpay="' + esc(o.id) + '">Konfirmasi Bayar</button> '
+                : '<span class="badge pending" style="margin-right:4px;">' + (isPayExpired(o) ? 'Waktu bayar habis' : 'Menunggu bukti bayar pembeli') + '</span> ')
+            : '') +
+          (o.status === 'pending_payment' && o.payment_method !== 'direct' ? '<span class="badge info" style="margin-right:4px;">Menunggu dana Rekber</span> ' + proofLinkHtml(o.payment_proof_url) + ' ' : '') +
           vendorProcessActions(o) +
           (o.status === 'processed' ? '<button class="btn primary small" data-vshiporder="' + esc(o.id) + '">Kirim</button> ' : '') +
           (o.status === 'pending' || o.status === 'pending_payment' ? '<button class="btn danger small" data-vcancelorder="' + esc(o.id) + '">Tolak</button>' : '') +
@@ -5613,6 +5915,7 @@ function vendorWalletPage() {
 }
 
 function attachVendorEvents() {
+    // ============ PENGIRIMAN ============
   const vpHermesPickup = document.getElementById('vpHermesPickup');
   if (vpHermesPickup) vpHermesPickup.onchange = () => {
     document.getElementById('vpHermesPickupFields').style.display = vpHermesPickup.checked ? 'block' : 'none';
@@ -5651,6 +5954,7 @@ function attachVendorEvents() {
     showToast('Metode pengiriman disimpan ✅', 'success');
     renderVendorPanel();
   };
+  // ============ SIMPAN PROFIL TOKO ============
   const vpSaveBtn = document.getElementById('vpSaveBtn');
   if (vpSaveBtn) vpSaveBtn.onclick = async () => {
     const v = vendorState.profile;
@@ -5672,6 +5976,7 @@ function attachVendorEvents() {
     renderVendorPanel();
   };
 
+  // ============ METODE PEMBAYARAN VENDOR ============
   renderVendorPms();
 
   const vpmType = document.getElementById('vpmType');
@@ -5685,6 +5990,7 @@ function attachVendorEvents() {
       const labelInput = document.getElementById('vpmLabel');
       const detailInput = document.getElementById('vpmDetail');
 
+      // Guard: kalau ada element yang hilang, jangan crash
       if (!labelText || !detailWrap || !detailText || !labelInput || !detailInput) return;
 
       if (t === 'bank') {
@@ -5770,9 +6076,11 @@ function attachVendorEvents() {
     renderVendorPanel();
   };
 
+  // ============ TAMBAH PRODUK ============
   const vNewProductBtn = document.getElementById('vNewProductBtn');
   if (vNewProductBtn) vNewProductBtn.onclick = openNewProductForm;
 
+  // ============ HAPUS PRODUK ============
   document.querySelectorAll('[data-vdelproduct]').forEach(el => el.onclick = async () => {
     if (!confirm('Hapus produk ini?')) return;
     const { data: result, error } = await sb.rpc('rw_delete_product', { p_id: el.dataset.vdelproduct });
@@ -5782,6 +6090,7 @@ function attachVendorEvents() {
     renderVendorPanel();
   });
 
+  // ============ PROSES PESANAN ============
   document.querySelectorAll('[data-vpaycomm]').forEach(el => el.onclick = () => openCommissionModal(el.dataset.vpaycomm));
   document.querySelectorAll('[data-vprocessorder]').forEach(el => el.onclick = async () => {
     const { error } = await sb.from('sub_vendor_orders').update({ status: 'processed' }).eq('id', el.dataset.vprocessorder);
@@ -5791,6 +6100,7 @@ function attachVendorEvents() {
     renderVendorPanel();
   });
 
+  // ============ TOLAK PESANAN ============
   document.querySelectorAll('[data-vcancelorder]').forEach(el => el.onclick = async () => {
     if (!confirm('Tolak pesanan ini? Stok akan dikembalikan dan pembeli diberi tahu.')) return;
     const { error } = await sb.from('sub_vendor_orders').update({ status: 'cancelled' }).eq('id', el.dataset.vcancelorder);
@@ -5800,6 +6110,7 @@ function attachVendorEvents() {
     renderVendorPanel();
   });
 
+  // ============ KIRIM PESANAN ============
   document.querySelectorAll('[data-vshiporder]').forEach(el => el.onclick = async () => {
     const { error } = await sb.from('sub_vendor_orders').update({ status: 'shipped' }).eq('id', el.dataset.vshiporder);
     if (error) { showToast(error.message, 'error'); return; }
@@ -5808,6 +6119,7 @@ function attachVendorEvents() {
     renderVendorPanel();
   });
 
+  // ============ KONFIRMASI PEMBAYARAN LANGSUNG ============
   document.querySelectorAll('[data-vconfirmpay]').forEach(el => el.onclick = async () => {
     if (!confirm('Pembayaran sudah kamu terima?')) return;
     const { error } = await sb.from('sub_vendor_orders').update({ status: 'paid' }).eq('id', el.dataset.vconfirmpay);
@@ -5817,8 +6129,10 @@ function attachVendorEvents() {
     renderVendorPanel();
   });
 
+  // ============ EDIT PRODUK ============
   document.querySelectorAll('[data-veditproduct]').forEach(el => el.onclick = () => openEditProduct(el.dataset.veditproduct));
 
+  // ============ BALAS REVIEW ============
   document.querySelectorAll('[data-vreplyreview]').forEach(el => el.onclick = async () => {
     const id = el.dataset.vreplyreview;
     const inp = document.getElementById('vreply-' + id);
@@ -5891,6 +6205,7 @@ function attachVendorEvents() {
     });
   });
 
+  // ============ AJUKAN PENCAIRAN ============
   const vwRequestBtn = document.getElementById('vwRequestBtn');
   if (vwRequestBtn) vwRequestBtn.onclick = async () => {
     const amount = Number(document.getElementById('vwAmount').value) || 0;
@@ -5916,6 +6231,9 @@ function attachVendorEvents() {
   };
 }
 
+// ============================================================
+// FORM TAMBAH PRODUK VENDOR
+// ============================================================
 function variantRowHtml(v){
   v = v || {};
   return '<div class="vrow panel-card" data-vid="' + esc(v.id || '') + '" style="padding:10px;margin-bottom:8px;">' +
@@ -6051,6 +6369,7 @@ async function saveEditProduct() {
 
   const r1 = await sb.from('products').update({ name, description, images, category_id }).eq('id', pid);
   if (r1.error) { reset(); showToast(esc(r1.error.message), 'error'); return; }
+  // varian yang dibuang dari form -> hapus; kalau sudah punya riwayat pesanan, stoknya dinolkan saja
   const keep = variants.filter(x => x.id).map(x => x.id);
   const gone = (p.product_variants || []).filter(x => !keep.includes(x.id));
   if (!variants.length) { reset(); showToast('Minimal harus ada 1 varian', 'error'); return; }
@@ -6100,6 +6419,7 @@ async function saveNewProduct() {
     variants.map(x => ({ product_id: prod.id, size: x.size, color: x.color, price: x.price, stock: x.stock }))
   );
   if (e2) {
+    // batalkan produk supaya tidak ada produk tanpa varian
     await sb.from('products').delete().eq('id', prod.id);
     reset();
     showToast('Varian gagal disimpan, produk dibatalkan: ' + e2.message, 'error');
@@ -6112,6 +6432,7 @@ async function saveNewProduct() {
   renderVendorPanel();
 }
 
+// ---------- edit metode pembayaran vendor ----------
 function openEditVpm(id){
   const pm = (vendorState.pms || []).find(x => x.id === id);
   if (!pm) return;
@@ -6149,6 +6470,9 @@ async function saveEditVpm(){
   await vendorLoadAll();
   renderVendorPanel();
 }
+// ============================================================
+// SHIPPING METHODS (COD)
+// ============================================================
 function renderShippingOption({ vendorId, method, icon, name, price, desc, selected }) {
   return '<div class="courier-opt' + (selected ? ' selected' : '') + '" data-ship-vendor="' + esc(vendorId) + '" data-ship-method="' + esc(method) + '"' +
       ' data-ship-name="' + esc(name) + '" data-ship-price="' + (Number(price) || 0) + '" onclick="pickShippingMethod(this)">' +
@@ -6201,10 +6525,16 @@ function updateShippingNotesField(){
   label.textContent = cfg[pick][0];
   ta.placeholder = cfg[pick][1];
 }
+// ============================================================
+// SWITCH KE MODE BELANJA (dari vendor panel)
+// ============================================================
 function switchToBuyerMode() {
   return showApp(true);
 }
 
+// ============================================================
+// ERROR HANDLER GLOBAL
+// ============================================================
 window.addEventListener('error', function(e) {
   console.error('[Restreet Error]', e.message, e.filename, e.lineno);
 });
@@ -6212,6 +6542,9 @@ window.addEventListener('unhandledrejection', function(e) {
   console.error('[Restreet Promise Error]', e.reason);
 });
 
+// ============================================================
+// AUTO INIT
+// ============================================================
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', init);
 } else {
